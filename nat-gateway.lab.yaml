@@ -1,0 +1,288 @@
+# NAT gateway: masquerade and port forwarding
+# A private LAN, a gateway and an outside server are network namespaces in this one VM.
+# Everything is installed by the setup below, from Ubuntu's archive, the first time it starts.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq nftables conntrack curl python3 iproute2 iputils-ping traceroute tcpdump netcat-openbsd
+  # The stock firewall service would load /etc/nftables.conf into the VM itself; here it belongs to gw.
+  systemctl disable --now nftables >/dev/null 2>&1
+  mkdir -p /etc/netlab
+  cat > /usr/local/bin/netlab <<'NETLAB_TOOL_END'
+  #!/usr/bin/env python3
+  """netlab: a gateway, a LAN host and an outside server as network namespaces, from /etc/netlab/topology.
+    netlab up | down | reset | status | shell <node>
+  Real tools work too: ip netns exec <node> <command>, for example nft list ruleset on gw."""
+  import ipaddress, os, shutil, subprocess as sp, sys, time
+
+  TOPO = '/etc/netlab/topology'
+  WEB, RULES, ORIGINAL = '/usr/local/bin/netlab-web', '/etc/nftables.conf', '/etc/netlab/nftables.conf.original'
+
+  def run(*a, ns=None, quiet=False):
+      c = ['ip', 'netns', 'exec', ns, *a] if ns else list(a)
+      r = sp.run(c, stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.PIPE, text=True)
+      if r.returncode and not quiet:
+          sys.exit('netlab: %s: %s' % (' '.join(c), r.stderr.strip()))
+      return r
+
+  def load():
+      t = {'router': [], 'host': [], 'link': [], 'isolated': [], 'serve': []}
+      for line in open(TOPO):
+          w = line.split('#')[0].split()
+          if w: t[w[0]].extend([w[1:]] if w[0] in ('link', 'serve') else w[1:])
+      return t
+
+  def up():
+      t = load()
+      nodes = t['router'] + t['host']
+      if run('ip', 'netns', 'list').stdout.strip():
+          sys.exit('netlab: already up (netlab reset starts it again)')
+      for n in nodes:
+          run('ip', 'netns', 'add', n)
+          run('ip', 'link', 'set', 'lo', 'up', ns=n)
+          run('sysctl', '-qw', 'net.ipv4.ip_forward=' + str(int(n in t['router'])), ns=n)
+      for a, b, net in t['link']:
+          net = ipaddress.ip_network(net)
+          ends = list(net.hosts())[:2]
+          run('ip', 'link', 'add', 'to-' + b, 'netns', a, 'type', 'veth', 'peer', 'name', 'to-' + a, 'netns', b)
+          for me, peer, mine, theirs in ((a, b, ends[0], ends[1]), (b, a, ends[1], ends[0])):
+              run('ip', 'addr', 'add', '%s/%d' % (mine, net.prefixlen), 'dev', 'to-' + peer, ns=me)
+              run('ip', 'link', 'set', 'to-' + peer, 'up', ns=me)
+              if me in t['host'] and me not in t['isolated']:
+                  run('ip', 'route', 'add', 'default', 'via', str(theirs), ns=me)
+      os.makedirs('/var/log/netlab', exist_ok=True)
+      for node, port, name in t['serve']:
+          log = open('/var/log/netlab/%s.log' % name, 'ab')
+          sp.Popen(['ip', 'netns', 'exec', node, WEB, port, name, log.name], stdin=sp.DEVNULL,
+                   stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True)
+      # What the gateway is set to is the file, loaded fresh every time; a mistake in it is said, not fatal.
+      for r in t['router']:
+          if os.path.exists(RULES):
+              loaded = run('nft', '-f', RULES, ns=r, quiet=True)
+              if loaded.returncode: print('netlab: %s was not loaded into %s: %s' % (RULES, r, loaded.stderr.strip()))
+      print('netlab: up: ' + ' '.join(nodes))
+
+  def down():
+      t = load()
+      run('pkill', '-f', WEB, quiet=True)
+      time.sleep(0.3)
+      for n in t['router'] + t['host']:
+          run('ip', 'netns', 'del', n, quiet=True)
+
+  def status():
+      t = load()
+      for n in t['router'] + t['host']:
+          print('%s (%s)' % (n, 'router' if n in t['router'] else 'host'))
+          out = run('ip', '-br', '-4', 'addr', ns=n, quiet=True).stdout
+          if not out: sys.exit('netlab: not up (netlab reset)')
+          for l in out.splitlines():
+              if not l.startswith('lo '):
+                  w = l.split()
+                  print('  %s %s' % (w[0].split('@')[0], w[2]))
+      for node, port, name in t['serve']:
+          print('%s serves %s on port %s' % (node, name, port))
+
+  def shell(n):
+      t = load()
+      if n not in t['router'] + t['host']:
+          sys.exit('netlab: no node %s (one of: %s)' % (n, ' '.join(t['router'] + t['host'])))
+      os.makedirs('/run/netlab', exist_ok=True)
+      rc = '/run/netlab/%s.rc' % n
+      open(rc, 'w').write("PS1='%s# '\n" % n)
+      os.execvp('ip', ['ip', 'netns', 'exec', n, 'bash', '--rcfile', rc, '-i'])
+
+  if os.geteuid():
+      os.execvp('sudo', ['sudo', sys.executable] + sys.argv)
+  cmd, args = (sys.argv[1:2] or ['status'])[0], sys.argv[2:]
+  if cmd == 'up': up()
+  elif cmd == 'down': down()
+  elif cmd == 'reset':
+      down()
+      shutil.copy(ORIGINAL, RULES)
+      up()
+  elif cmd == 'status': status()
+  elif cmd == 'shell' and args: shell(args[0])
+  else: sys.exit(__doc__)
+  NETLAB_TOOL_END
+  chmod 755 /usr/local/bin/netlab
+  cat > /usr/local/bin/netlab-web <<'NETLAB_WEB_END'
+  #!/usr/bin/env python3
+  """netlab-web <port> <name> <logfile>: answers every GET with its name and the address it came from."""
+  import http.server, sys, time
+  port, name, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+      def do_GET(self):
+          who = self.client_address[0]
+          body = ('%s: you are %s\n' % (name, who)).encode()
+          self.send_response(200)
+          self.send_header('Content-Length', str(len(body)))
+          self.end_headers()
+          self.wfile.write(body)
+          open(log, 'a').write('%s %s %s\n' % (time.strftime('%H:%M:%S'), who, self.path))
+      def log_message(self, *a): pass
+
+  http.server.ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
+  NETLAB_WEB_END
+  chmod 755 /usr/local/bin/netlab-web
+  cat > /etc/netlab/topology <<'NETLAB_TOPOLOGY_END'
+  # router and host machines, then links: "link A B subnet" gives A the first address, B the second.
+  # "isolated" is a host with no default route; "serve" is a web page: machine, port, name.
+  router gw
+  host lan srv
+  isolated srv
+  link gw lan 10.0.0.0/24
+  link gw srv 203.0.113.0/24
+  serve lan 80 lan-web
+  serve lan 8081 lan-private
+  serve srv 8000 outside-server
+  NETLAB_TOPOLOGY_END
+  cat > /etc/nftables.conf <<'NETLAB_RULES_END'
+  #!/usr/sbin/nft -f
+  # Loaded into the gateway (gw) every time the lab starts. Only what is in this file survives a restart.
+  flush ruleset
+
+  table inet filter {
+    chain forward {
+      type filter hook forward priority 0; policy drop;
+      ct state established,related accept
+      iifname "to-lan" accept
+    }
+  }
+  NETLAB_RULES_END
+  cp /etc/nftables.conf /etc/netlab/nftables.conf.original
+  cat > /etc/systemd/system/netlab.service <<'NETLAB_UNIT_END'
+  [Unit]
+  Description=NAT gateway lab: a LAN, a gateway and an outside server as namespaces
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/netlab up
+  ExecStop=/usr/local/bin/netlab down
+
+  [Install]
+  WantedBy=multi-user.target
+  NETLAB_UNIT_END
+  systemctl daemon-reload
+  systemctl enable netlab >/dev/null 2>&1
+  home=/home/student
+  [ -d $home ] || home=/root
+  cat > $home/README.md <<'NETLAB_README_END'
+  # Lab: NAT gateway, masquerade and port forwarding
+
+  Three machines, built in this VM. Each is a network namespace; `gw` is the gateway between a
+  private network and the outside.
+
+      lan ------ gw ------ srv
+      10.0.0.0/24    203.0.113.0/24  (the outside: a documentation range)
+
+  | link     | network        | first address | second address |
+  |----------|----------------|---------------|----------------|
+  | gw - lan | 10.0.0.0/24    | gw 10.0.0.1   | lan 10.0.0.2   |
+  | gw - srv | 203.0.113.0/24 | gw 203.0.113.1 | srv 203.0.113.2 |
+
+  - lan is a private machine. Its default route is the gateway. It serves a web page on port 80
+    and a private one on port 8081.
+  - srv is the outside server, on port 8000. It answers every request with the address it saw
+    the request come from, and keeps a log in /var/log/netlab/outside-server.log. It has no
+    route to 10.0.0.0/24, as on the real internet.
+  - gw forwards between the two. Its rules are in /etc/nftables.conf, which is loaded into gw
+    every time the lab starts: what is typed into the running gateway and not put in that file is
+    lost when the VM restarts. Today the file lets the LAN start connections and drops the rest.
+
+  ## What to do
+
+  1. From lan, ask srv for its page: `curl -m 3 http://203.0.113.2:8000/`. It fails. Watch each
+     link with tcpdump, and find where the reply is lost and why. What is the source address of the
+     request when it arrives at srv?
+  2. Make the gateway translate the addresses of the LAN's traffic as it leaves, so that srv
+     answers and sees the gateway's outside address and no private one. Use nftables, in a table
+     of family ip with the right hook.
+  3. Read what the gateway remembers about the connection: `conntrack -L` in gw.
+  4. Now make the LAN's web page, port 80 on lan, reachable from the outside at the gateway's
+     outside address on port 8080: `curl -m 3 http://203.0.113.1:8080/` from srv. Look at what
+     the web page says it saw. The gateway's forward chain drops what it was not told to allow, so
+     allow that one flow and nothing wider: the private page on port 8081, and every other port of
+     the gateway, must stay shut to the outside.
+  5. Save the ruleset in /etc/nftables.conf and restart the lab with `netlab reset`; check that
+     both curls still work.
+
+  ## The tools
+
+  - `netlab status`            every machine, its addresses and what it serves
+  - `netlab shell <name>`      a shell inside a machine (gw, lan or srv), as root
+  - `netlab reset`             put /etc/nftables.conf back as it was and start the lab again
+  - `sudo ip netns exec gw nft list ruleset`    what the gateway is set to now
+  - `sudo ip netns exec gw conntrack -L`        the connections the gateway is tracking
+  - `sudo ip netns exec gw tcpdump -ni to-srv`  watch a link (the interfaces are called to-<neighbour>)
+  - `curl`, `ip route`, `ip -br addr` and `nc` work in any machine the same way
+
+  `nft list ruleset` prints rules in the form `nft -f` loads, so it is also how a ruleset is saved.
+  NETLAB_README_END
+  chown student:student $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  systemctl start netlab 2>/dev/null || netlab up
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  fail() {
+    echo "NOT PASSED: $*"
+    echo "--- gw ruleset"; ip netns exec gw nft list ruleset 2>&1 | head -40
+    exit 1
+  }
+  # Wait for the lab to be up after the boot: the namespaces, then both web pages and the server.
+  for i in $(seq 1 40); do
+    ip netns list | grep -qw gw && ip netns exec lan ss -ltn 2>/dev/null | grep -q ':80 ' && ip netns exec srv ss -ltn 2>/dev/null | grep -q ':8000 ' && break
+    sleep 2
+  done
+  ip netns list | grep -qw gw || { netlab up >/dev/null 2>&1; sleep 2; }
+  get() { ip netns exec "$1" curl -s -m 3 "$2" 2>/dev/null; }
+  # The machines are as they were built: every address, every route, and nothing else on any of them.
+  while read n d a; do
+    ip -n $n -4 -o addr show dev $d 2>/dev/null | grep -q " $a " || fail "$n should have $a on $d: the topology was changed"
+  done <<TOPOLOGY_END
+  gw to-lan 10.0.0.1/24
+  gw to-srv 203.0.113.1/24
+  lan to-gw 10.0.0.2/24
+  srv to-gw 203.0.113.2/24
+  TOPOLOGY_END
+  for n in gw lan srv; do
+    want=1; [ "$n" = gw ] && want=2
+    have=$(ip -n $n -4 -o addr show | grep -vc " lo ")
+    [ "$have" = "$want" ] || fail "$n has addresses that were added: $have, not $want"
+    [ "$(ip -n $n -4 -o addr show dev lo | wc -l)" = 1 ] || fail "$n has an extra address on lo"
+  done
+  [ "$(ip netns exec gw sysctl -n net.ipv4.ip_forward)" = 1 ] || fail "gw does not forward"
+  ip -n srv -4 route show | grep -vq '^203.0.113.0/24' && fail "srv has a route it was built without: the outside must know nothing of 10.0.0.0/24"
+  ip -n lan -4 route show | grep -v '^10.0.0.0/24' | grep -vq '^default via 10.0.0.1 ' && fail "lan has a route it was built without"
+  ip -n gw -4 route show | grep -vq '^10.0.0.0/24\|^203.0.113.0/24' && fail "gw has a route it was built without"
+  # Behaviour first. The LAN host asks the outside server, which says which address it saw.
+  seen=$(get lan http://203.0.113.2:8000/)
+  [ -n "$seen" ] || fail "the LAN host (10.0.0.2) cannot reach the outside server at 203.0.113.2:8000: is the gateway translating the LAN's addresses, and is it saved in /etc/nftables.conf?"
+  [ "$seen" = "outside-server: you are 203.0.113.1" ] || fail "the outside server saw '$seen': it should see the gateway's outside address, 203.0.113.1"
+  tail -n 1 /var/log/netlab/outside-server.log | grep -q ' 203.0.113.1 ' || fail "the outside server's log does not show 203.0.113.1 for the last request"
+  # The outside asks the gateway's outside address, and the LAN page answers.
+  page=$(get srv http://203.0.113.1:8080/)
+  [ -n "$page" ] || fail "the outside cannot reach the LAN web page at the gateway's address 203.0.113.1, port 8080: is there a forward, and does the gateway's forward chain allow it?"
+  [ "$page" = "lan-web: you are 203.0.113.2" ] || fail "the LAN web page answered '$page': it should see the outside client's own address, 203.0.113.2: the destination is rewritten by the gateway, not proxied by it"
+  # Nothing wider than that one port, and no blanket permission in the firewall.
+  [ -z "$(get srv http://203.0.113.1:8081/)" ] || fail "the outside reaches the private page on the LAN host through the gateway: forward port 8080 to port 80 and nothing more"
+  [ -z "$(get srv http://203.0.113.1:80/)" ] || fail "the outside reaches the LAN web page on the gateway's port 80: only port 8080 is forwarded"
+  rules=$(ip netns exec gw nft list ruleset 2>/dev/null)
+  echo "$rules" | grep -qE 'hook forward .*policy drop' || fail "the gateway's forward chain no longer drops what it was not told to allow (policy drop)"
+  echo "$rules" | grep -qE '^[[:space:]]+(counter )?accept[[:space:]]*$' && fail "the gateway has a rule that accepts everything: allow the one flow and nothing wider"
+  echo "$rules" | grep -qE 'masquerade|snat to' || fail "no masquerade or snat rule on the gateway"
+  echo "$rules" | grep -q 'dnat to' || fail "no dnat rule on the gateway"
+  ip netns exec gw nft -c -f /etc/nftables.conf >/dev/null 2>&1 || fail "/etc/nftables.conf does not load into the gateway"
+  echo "PASSED: the LAN host reaches the outside server as the gateway's address 203.0.113.1, the outside reaches the LAN web page on port 8080 only, and it is all in /etc/nftables.conf"
