@@ -1,5 +1,7 @@
 # NAT gateway lab: masquerade and port forwarding with nftables in an Ubuntu VM
 
+[English](README.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [Español](README.es.md)
+
 [![check](https://github.com/mitsurutech/lab-nat-gateway/actions/workflows/check.yml/badge.svg)](https://github.com/mitsurutech/lab-nat-gateway/actions/workflows/check.yml)
 
 A ready-made **NAT lab** for classrooms, from the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning), where schools and colleges give every student their own machines and a terminal in the browser. Each student gets an Ubuntu VM with a small network built inside it: a private LAN host, a **gateway** and an outside server. They configure **masquerade (source NAT)** and a **port forward (destination NAT)** with **nftables** on the gateway, save the rules so they survive a restart, and see with their own eyes what the other end sees. Nothing is installed on the student's computer.
@@ -58,4 +60,6 @@ More labs from the same place: [lab-netlab](https://github.com/mitsurutech/lab-n
 
 ## Licence
 
-The lab definition, the `netlab` tool and this documentation are MIT licensed, see [LICENSE](LICENSE): copy them, change them, teach with them. nftables and conntrack-tools are GPL-2.0 licensed and are installed from Ubuntu's archive when a VM starts; nothing of them is distributed here.
+This work is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). You may share it and adapt it for learning and teaching, if you credit Mitsuru Technologies Ltd, do not use it commercially, and share anything you make from it under the same licence. The full text is in the `LICENSE` file.
+
+nftables and conntrack-tools are GPL-2.0 licensed and are installed from Ubuntu's archive when a VM starts; nothing of them is distributed here.
