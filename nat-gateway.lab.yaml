@@ -96,7 +96,8 @@ setup: |
           sys.exit('netlab: no node %s (one of: %s)' % (n, ' '.join(t['router'] + t['host'])))
       os.makedirs('/run/netlab', exist_ok=True)
       rc = '/run/netlab/%s.rc' % n
-      open(rc, 'w').write("PS1='%s# '\n" % n)
+      # The VM's web proxy is not on these machines' network, so a shell in one leaves it out.
+      open(rc, 'w').write("PS1='%s# '\nunset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY\n" % n)
       os.execvp('ip', ['ip', 'netns', 'exec', n, 'bash', '--rcfile', rc, '-i'])
 
   if os.geteuid():
@@ -214,8 +215,9 @@ setup: |
      the web page says it saw. The gateway's forward chain drops what it was not told to allow, so
      allow that one flow and nothing wider: the private page on port 8081, and every other port of
      the gateway, must stay shut to the outside.
-  5. Save the ruleset in /etc/nftables.conf and restart the lab with `netlab reset`; check that
-     both curls still work.
+  5. Save the ruleset in /etc/nftables.conf and restart the lab with `netlab down` and then
+     `netlab up`, which loads that file; check that both curls still work. (Not `netlab reset`:
+     it puts the original file back over yours.)
 
   ## The tools
 
@@ -226,6 +228,10 @@ setup: |
   - `sudo ip netns exec gw conntrack -L`        the connections the gateway is tracking
   - `sudo ip netns exec gw tcpdump -ni to-srv`  watch a link (the interfaces are called to-<neighbour>)
   - `curl`, `ip route`, `ip -br addr` and `nc` work in any machine the same way
+
+  The VM reaches its package archives through a web proxy that is not on these machines' network,
+  so `netlab shell` leaves it out. With `sudo ip netns exec`, give curl `--noproxy '*'`, or it
+  asks the proxy and fails at once with "via 10.0.2.100".
 
   `nft list ruleset` prints rules in the form `nft -f` loads, so it is also how a ruleset is saved.
   NETLAB_README_END
@@ -247,7 +253,7 @@ check: |
     sleep 2
   done
   ip netns list | grep -qw gw || { netlab up >/dev/null 2>&1; sleep 2; }
-  get() { ip netns exec "$1" curl -s -m 3 "$2" 2>/dev/null; }
+  get() { ip netns exec "$1" curl --noproxy '*' -s -m 3 "$2" 2>/dev/null; }
   # The machines are as they were built: every address, every route, and nothing else on any of them.
   while read n d a; do
     ip -n $n -4 -o addr show dev $d 2>/dev/null | grep -q " $a " || fail "$n should have $a on $d: the topology was changed"
